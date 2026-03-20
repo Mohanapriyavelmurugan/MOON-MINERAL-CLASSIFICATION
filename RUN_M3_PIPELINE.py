@@ -16,9 +16,30 @@ import os
 import subprocess
 import sys
 
-# Define the path to your scenes and scripts
-WORKSPACE = r"d:\Moon"
-SCENE_HDR = r"D:\Moon_Data\Scene_2\M3G20081201T064047_V01_RFL.HDR"
+def banner(msg): 
+    print("\n" + "#"*80)
+    print(f"### {msg}")
+    print("#"*80 + "\n")
+
+if len(sys.argv) < 2:
+    print("Usage: python RUN_M3_PIPELINE.py <path/to/scene.HDR>")
+    # If no argument is provided, ask the user to input the path directly here,
+    # or you can fall back to a default testing path.
+    user_input = input("Please enter the path to the M3 SCENE HDR file: ")
+    if user_input.strip() == "":
+        print("No path provided. Exiting.")
+        sys.exit(1)
+    else:
+        SCENE_HDR = os.path.abspath(user_input.strip('\"\''))
+else:
+    SCENE_HDR = os.path.abspath(sys.argv[1])
+
+if not os.path.exists(SCENE_HDR):
+    print(f"ERROR: Input file not found -> {SCENE_HDR}")
+    sys.exit(1)
+
+# Define the workspace as the directory where this script sits
+WORKSPACE = os.path.dirname(os.path.abspath(__file__))
 
 # The 4 stages of the pipeline
 SCRIPTS = [
@@ -27,11 +48,6 @@ SCRIPTS = [
     ("3. ML Denoising (CNN + Autoencoder)", "MOON_ML_DENOISING.py"),
     ("4. Scientific Validation", "MOON_VALIDATION.py")
 ]
-
-def banner(msg): 
-    print("\n" + "#"*80)
-    print(f"### {msg}")
-    print("#"*80 + "\n")
 
 banner("STARTING END-TO-END M3 PIPELINE")
 print(f"Processing Scene: {SCENE_HDR}")
@@ -44,14 +60,13 @@ for stage_name, script_name in SCRIPTS:
         print(f"ERROR: Script not found -> {script_path}")
         sys.exit(1)
         
-    print(f"Running: python {script_name} ...\n")
+    print(f"Running: python {script_name} \"{SCENE_HDR}\" ...\n")
     
-    # Run the script and stream the output to the console
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     
     process = subprocess.Popen(
-        [sys.executable, script_path], 
+        [sys.executable, script_path, SCENE_HDR], 
         stdout=subprocess.PIPE, 
         stderr=subprocess.STDOUT,
         text=True,
@@ -71,5 +86,12 @@ for stage_name, script_name in SCRIPTS:
 
 banner("PIPELINE COMPLETED SUCCESSFULLY")
 print("The data is now ready for mineral identification.")
-print("Final Output: D:\\Moon_Data\\Scene_2\\ML_Denoised\\M3G20081118T222604_V01_RFL_FINAL.hdr")
-print("Validation Report: D:\\Moon_Data\\Scene_2\\Validation\\scientific_validation_proof.txt")
+
+# Infer final output paths for the success message
+scene_dir = os.path.dirname(SCENE_HDR)
+scene_base = os.path.basename(SCENE_HDR).replace('.HDR', '').replace('.hdr', '')
+final_hdr = os.path.join(scene_dir, "ML_Denoised", f"{scene_base}_FINAL.hdr")
+val_txt = os.path.join(scene_dir, "Validation", "scientific_validation_proof.txt")
+
+print(f"Final Output: {final_hdr}")
+print(f"Validation Report: {val_txt}")

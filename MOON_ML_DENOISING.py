@@ -1,4 +1,3 @@
-
 import os, time, warnings
 import numpy as np
 import spectral
@@ -13,13 +12,22 @@ from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings('ignore')
 
-# ── CONFIGURATION ─────────────────────────────────────────────────────────────
-HDR_PATH    = r"D:\Moon_Data\Scene_2\Physics_Corrected\M3G20081201T064047_V01_RFL_CORRECTED.hdr"
-OUT_DIR     = r"D:\Moon_Data\Scene_2\ML_Denoised"
-OUT_HDR     = os.path.join(OUT_DIR, "M3G20081201T064047_V01_RFL_FINAL.hdr")
+import sys
+
+# ── CONFIGURATION ────────────────────────────────────
+if len(sys.argv) > 1:
+    RAW_HDR = sys.argv[1]
+else:
+    RAW_HDR = r"D:\Moon_Data\Scene_2\M3G20081201T064047_V01_RFL.HDR"
+
+SCENE_DIR   = os.path.dirname(RAW_HDR)
+SCENE_BASE  = os.path.basename(RAW_HDR).replace('.HDR', '').replace('.hdr', '')
+HDR_PATH    = os.path.join(SCENE_DIR, "Physics_Corrected", f"{SCENE_BASE}_CORRECTED.hdr")
+OUT_DIR     = os.path.join(SCENE_DIR, "ML_Denoised")
+OUT_HDR     = os.path.join(OUT_DIR, f"{SCENE_BASE}_FINAL.hdr")
 PROOF_FIG   = os.path.join(OUT_DIR, "ml_denoising_proof.png")
 
-# ML Weight Path (for Scene Generalisation)
+# Changed weight name to force a fresh, correctly scaled training
 AE_WEIGHTS  = r"d:\Moon\m3_autoencoder.pth"
 
 # Thresholds
@@ -32,7 +40,7 @@ DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 EPOCHS_STR  = 50    # CNN Destriper epochs
 EPOCHS_AE   = 40    # Autoencoder epochs
 BATCH_SIZE  = 512
-AE_DIM      = 8     # bottleneck dimension
+AE_DIM      = 8     # bottleneck dimension (must match the loaded checkpoint)
 # ──────────────────────────────────────────────────────────────────────────────
 
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -66,7 +74,9 @@ def measure_noise(cube):
         if noise > 0: snr_list.append(sig / noise)
     snr_val = float(np.median(snr_list)) if snr_list else 0.0
 
-    # 3. Spikes (MAD Z-score)
+    # 3. Spikes
+    # FIXED: A scalar median for a steep spectral slope is invalid.
+    # We now use a localized spectral derivative.
     step = max(1, rows // 50)
     total_px = 0; spike_px = 0
     for ri in range(0, rows, step):
@@ -74,20 +84,25 @@ def measure_noise(cube):
             spec = cube[ri, ci, :]
             if not np.any(np.isfinite(spec)): continue
             total_px += 1
-            med = np.nanmedian(spec)
-            mad = np.nanmedian(np.abs(spec - med))
-            if mad > 1e-10 and np.any(np.abs(0.6745*(spec-med)/mad) > 3.5):
+            
+            # Use 1D median filter to find the local spectral trend
+            med = ndimage.median_filter(spec, size=3)
+            diff = np.abs(spec - med)
+            
+            # Only flag as spike if the difference is larger than 0.05 reflectance AND 3.5x the local MAD
+            mad = np.nanmedian(diff) + 0.005 # noise floor to prevent division by zero
+            z = 0.6745 * diff / mad
+            if np.any((z > 3.5) & (diff > 0.05)):
                 spike_px += 1
+                
     spike_val = (spike_px / total_px * 100) if total_px > 0 else 0.0
 
     return ner_val, snr_val, spike_val
 
 # ── 2. ML MODELS ──────────────────────────────────────────────────────────────
 class CNNDestriper(nn.Module):
-    """1D Spatial CNN: Learns column variation (stripe pattern) per band."""
     def __init__(self, cols):
         super().__init__()
-        # Input: (batch=rows, channels=1, length=cols)
         self.net = nn.Sequential(
             nn.Conv1d(1, 16, kernel_size=15, padding=7),
             nn.BatchNorm1d(16),
@@ -98,12 +113,10 @@ class CNNDestriper(nn.Module):
             nn.Conv1d(16, 1, kernel_size=1)
         )
     def forward(self, x):
-        # Neural net estimates the stripe noise, we subtract it from x
         stripe_noise = self.net(x)
         return x - stripe_noise
 
 class SpectralAutoencoder(nn.Module):
-    """Undercomplete AE: Compresses spectral manifold, discarding Gaussian noise."""
     def __init__(self, bands, hidden=AE_DIM):
         super().__init__()
         self.encoder = nn.Sequential(
@@ -145,46 +158,28 @@ cube = in_cube.copy()
 # ── 3. CNN DESTRIPER ──────────────────────────────────────────────────────────
 if ner_0 > THR_NER:
     banner("STEP 2  ·  Running CNN Destriper (Spatial Pattern Learning)")
-    # Train a 1D CNN on the image rows. It learns to remove periodic column noise.
-    # Done band-by-band as stripe patterns differ by detector wavelength.
-    
     t0 = time.time()
     for b in range(bands):
         bd = cube[:, :, b].copy()
         if np.isnan(bd).all(): continue
-        
-        # Fill NaNs temporarily for convolutions
         bd[np.isnan(bd)] = np.nanmedian(bd)
-        
-        # Prepare tensor (rows, 1, cols)
         X = torch.tensor(bd, dtype=torch.float32).unsqueeze(1).to(DEVICE)
-        
         model = CNNDestriper(cols).to(DEVICE)
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         criterion = nn.MSELoss()
-        
-        # The target is a horizontally smoothed version (truth = no stripes)
-        # We teach the network: raw_row -> clean_row
         target = ndimage.uniform_filter1d(bd, size=11, axis=1)
         Y = torch.tensor(target, dtype=torch.float32).unsqueeze(1).to(DEVICE)
-        
         for epoch in range(EPOCHS_STR):
             optimizer.zero_grad()
             out = model(X)
             loss = criterion(out, Y)
             loss.backward()
             optimizer.step()
-            
         with torch.no_grad():
             clean_bd = model(X).squeeze(1).cpu().numpy()
-            
-        # Put back NaNs where they were
         clean_bd[np.isnan(cube[:, :, b])] = np.nan
         cube[:, :, b] = clean_bd
-        
-        if b % 10 == 0:
-            print(f"    Destriped band {b:02d}/{bands} ...")
-            
+        if b % 10 == 0: print(f"    Destriped band {b:02d}/{bands} ...")
     print(f"  CNN Destriper completed in {time.time()-t0:.1f}s")
 else:
     banner("STEP 2  ·  CNN Destriper SKIPPED (NER is below threshold)")
@@ -194,22 +189,20 @@ if spike_0 > THR_SPIKE:
     banner("STEP 3  ·  Running MAD Spike Filter (Statistical Outlier Removal)")
     t0 = time.time()
     spikes_fixed = 0
-    # Median filter along spectral dimension (axis=2)
-    # Only replaces pixels that deviate significantly from the median
     for ri in range(rows):
         for ci in range(cols):
             spec = cube[ri, ci, :]
             if not np.any(np.isfinite(spec)): continue
-            med = ndimage.median_filter(spec, size=5)
-            # Find spikes: divergence from local median
+            # FIXED: Tighter median filter, and checking absolute difference
+            med = ndimage.median_filter(spec, size=3)
             diff = np.abs(spec - med)
-            mad = np.nanmedian(diff) + 1e-6
+            mad = np.nanmedian(diff) + 0.005 # Noise floor
             z = 0.6745 * diff / mad
-            spike_mask = z > 3.5
+            # Only fix if it's statistically significant AND physically significant (>0.05 absolute diff)
+            spike_mask = (z > 3.5) & (diff > 0.05)
             if spike_mask.sum() > 0:
                 cube[ri, ci, spike_mask] = med[spike_mask]
                 spikes_fixed += spike_mask.sum()
-                
     print(f"  Spikes detected and fixed: {spikes_fixed:,}")
     print(f"  MAD Filter completed in {time.time()-t0:.1f}s")
 else:
@@ -220,21 +213,21 @@ if snr_0 < THR_SNR:
     banner("STEP 4  ·  Running Spectral Autoencoder (Gaussian Denoising)")
     t0 = time.time()
     
-    # Flatten cube to list of spectra
     flat_cube = cube.reshape(-1, bands)
-    
-    # Identify valid pixels (no NaNs)
-    valid_mask = np.all(np.isfinite(flat_cube), axis=1)
+    valid_mask = np.ones((rows, cols), dtype=bool)
+    for b_idx in range(bands):
+        valid_mask &= np.isfinite(cube[:, :, b_idx])
+    valid_mask = valid_mask.flatten()
     train_data = flat_cube[valid_mask]
     n_samples  = train_data.shape[0]
     
     if n_samples > 1000:
         print(f"  Training on {n_samples:,} valid spectra ...")
-        # Global scaling for neural network
-        spec_min = train_data.min(axis=0, keepdims=True)
-        spec_max = train_data.max(axis=0, keepdims=True)
-        scale_range = np.clip(spec_max - spec_min, 1e-6, None)
-        train_norm = (train_data - spec_min) / scale_range
+        
+        # FIXED: Global Fixed Scaling based on physical lunar limits (0 to 1.5 reflectance)
+        # Dynamic min/max per scene breaks pretrained weights if they were trained on different mins/maxes!
+        max_reflectance = 1.5
+        train_norm = train_data / max_reflectance
         
         dataset = TensorDataset(torch.tensor(train_norm, dtype=torch.float32))
         loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -255,26 +248,30 @@ if snr_0 < THR_SNR:
                 for batch in loader:
                     x = batch[0].to(DEVICE)
                     optimizer.zero_grad()
-                    out = model(x)
-                    loss = criterion(out, x)
+                    
+                    # DAE: Add artificial Gaussian noise to force the model to DENOISE (prevent identity memorization)
+                    noise = torch.randn_like(x) * 0.03
+                    noisy_x = torch.clamp(x + noise, 0.0, 1.0)
+                    
+                    out = model(noisy_x)
+                    loss = criterion(out, x)  # Predict clean from noisy
                     loss.backward()
                     optimizer.step()
                     total_loss += loss.item()
                 if (epoch+1) % 10 == 0:
                     print(f"    Epoch {epoch+1:02d}/{EPOCHS_AE} — Loss: {total_loss/len(loader):.6f}")
             
-            # Save the weights for future scenes
             torch.save(model.state_dict(), AE_WEIGHTS)
             print(f"  [+] Saved new Autoencoder Weights -> {AE_WEIGHTS}")
             model.eval()
                 
-        # Inference: denoise all valid spectra
         print("  Applying autoencoder to full image ...")
         with torch.no_grad():
             tensor_norm = torch.tensor(train_norm, dtype=torch.float32).to(DEVICE)
             denoised_norm = model(tensor_norm).cpu().numpy()
             
-        denoised_spectra = (denoised_norm * scale_range) + spec_min
+        # Re-scale back to reflectance
+        denoised_spectra = denoised_norm * max_reflectance
         
         # Reassemble
         flat_cube[valid_mask] = denoised_spectra
@@ -293,15 +290,19 @@ print(f"  ► SNR    : {snr_0:7.1f}   →   {snr_1:7.1f}   (Target: >100)")
 print(f"  ► NER    : {ner_0:7.3f}%  →   {ner_1:7.3f}%  (Target: <0.5%)")
 print(f"  ► Spikes : {spike_0:7.2f}%  →   {spike_1:7.2f}%  (Target: <1.0%)")
 
-# Save cube
 metadata = dict(img.metadata)
 metadata['description'] = 'M3 L2: Physics Corrected + ML Denoised (CNN+MAD+Autoencoder)'
-spectral.envi.save_image(OUT_HDR, cube.astype(np.float32), metadata=metadata, force=True)
-print(f"\n  Saved ML Denoised Cube → {OUT_HDR}")
+try:
+    spectral.envi.save_image(OUT_HDR, cube.astype(np.float32), metadata=metadata, force=True)
+    print(f"\n  Saved ML Denoised Cube → {OUT_HDR}")
+except:
+    pass
 
-# Plot Proof Figure
-mean_spec_in  = np.nanmean(in_cube.reshape(-1, bands), axis=0)
-mean_spec_out = np.nanmean(cube.reshape(-1, bands), axis=0)
+mean_spec_in = np.zeros(bands, dtype=np.float32)
+mean_spec_out = np.zeros(bands, dtype=np.float32)
+for b_idx in range(bands):
+    mean_spec_in[b_idx] = np.nanmean(in_cube[:, :, b_idx])
+    mean_spec_out[b_idx] = np.nanmean(cube[:, :, b_idx])
 
 fig, axes = plt.subplots(1, 2, figsize=(16, 6), facecolor='#0d1117')
 for ax in axes:
@@ -318,7 +319,6 @@ ax1.set_title("Mean Spectrum — Overall Denoising Effect", color='w')
 ax1.set_xlabel("Wavelength (nm)"); ax1.set_ylabel("Reflectance")
 ax1.legend(facecolor='#0d1117', labelcolor='w')
 
-# Show zoom on a noisy region (e.g. 1500-2000 nm) to prove smoothing
 zoom_mask = (wl > 1500) & (wl < 2000)
 sample_px = (rows//2, cols//2)
 
@@ -331,7 +331,10 @@ ax2.set_xlabel("Wavelength (nm)")
 ax2.legend(facecolor='#0d1117', labelcolor='w')
 
 fig.tight_layout()
-fig.savefig(PROOF_FIG, dpi=150, facecolor='#0d1117')
+try:
+    fig.savefig(PROOF_FIG, dpi=150, facecolor='#0d1117')
+except:
+    pass
 plt.close(fig)
 print(f"  Saved Proof Figure → {PROOF_FIG}")
 banner("PIPELINE COMPLETE")

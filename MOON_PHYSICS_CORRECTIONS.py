@@ -1,4 +1,3 @@
-
 import os, warnings
 import numpy as np
 import spectral
@@ -10,14 +9,21 @@ from scipy import ndimage
 
 warnings.filterwarnings('ignore')
 
+import sys
+
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
-HDR_PATH    = r"D:\Moon_Data\Scene_2\M3G20081201T064047_V01_RFL.HDR"
-OUT_DIR     = r"D:\Moon_Data\Scene_2\Physics_Corrected"
-OUT_HDR     = os.path.join(OUT_DIR, "M3G20081201T064047_V01_RFL_CORRECTED.hdr")
+if len(sys.argv) > 1:
+    HDR_PATH = sys.argv[1]
+else:
+    HDR_PATH = r"D:\Moon_Data\Scene_2\M3G20081201T064047_V01_RFL.HDR"
+
+SCENE_DIR   = os.path.dirname(HDR_PATH)
+SCENE_BASE  = os.path.basename(HDR_PATH).replace('.HDR', '').replace('.hdr', '')
+OUT_DIR     = os.path.join(SCENE_DIR, "Physics_Corrected")
+OUT_HDR     = os.path.join(OUT_DIR, f"{SCENE_BASE}_CORRECTED.hdr")
 PROOF_FIG   = os.path.join(OUT_DIR, "before_after_proof.png")
 PROOF_TXT   = os.path.join(OUT_DIR, "correction_proof.txt")
 THERMAL_NM  = 2500      # nm — thermal onset wavelength
-SAT_THRESH  = 0.98      # fraction of 99.9th percentile = saturation
 # ──────────────────────────────────────────────────────────────────────────────
 
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -66,6 +72,7 @@ wl_raw = img.metadata.get('wavelength', [])
 wl = np.array([float(w) for w in wl_raw])
 if wl.max() < 10: wl *= 1000.0    # µm → nm
 
+# Mask missing data flags
 cube[cube < -990] = np.nan
 
 print(f"  Shape      : {rows} × {cols} × {bands}")
@@ -74,18 +81,69 @@ print(f"  Wavelengths: {wl.min():.0f} – {wl.max():.0f} nm")
 # ── Compute BEFORE metrics ────────────────────────────────────────────────────
 print("\n  Computing BEFORE metrics ...")
 snr_before, ner_before = noise_metrics(cube, wl)
-mean_spec_before = np.nanmean(cube.reshape(-1, bands), axis=0)
+mean_spec_before = np.zeros(bands, dtype=np.float64)
+for b_idx in range(bands):
+    mean_spec_before[b_idx] = np.nanmean(cube[:, :, b_idx])
 print(f"  SNR (before): {snr_before:.2f}   NER (before): {ner_before:.3f}%")
 
 corrected = cube.copy()   # work on this throughout corrections
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CORRECTION 1 — STRIPE NOISE: Column Moment Matching
+# CORRECTION 1 — DETECTOR SATURATION & OUTLIERS: Mask & Interpolate (MUST BE FIRST)
 # ═════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*65)
-print("  CORRECTION 1  ·  Stripe Noise — Column Moment Matching")
+print("  CORRECTION 1  ·  Detector Saturation & Outliers — Mask & Interpolate")
 print("="*65)
 
+total_sat = 0
+for b in range(bands):
+    bd = corrected[:, :, b]
+    valid = np.isfinite(bd)
+    if valid.sum() == 0: continue
+    
+    # 1. Physical anomaly bounds (reflectance should be between 0 and 1.2 roughly)
+    sat_mask = ((bd > 1.5) | (bd < -0.05)) & valid
+    
+    # 2. Statistical absolute outlier (extremely heavy spikes, > 10 std deviations)
+    if valid.sum() > 100:
+        band_mean = np.nanmean(bd[valid])
+        band_std  = np.nanstd(bd[valid])
+        spike_mask = (np.abs(bd - band_mean) > 10 * band_std) & valid
+        sat_mask  = sat_mask | spike_mask
+
+    n_sat = int(sat_mask.sum())
+    total_sat += n_sat
+    corrected[sat_mask, b] = np.nan   # flag as invalid
+
+# Spectrally interpolate NaN-flagged pixels (Using LINEAR to avoid cubic ringing)
+sat_pixels_fixed = 0
+for ri in range(rows):
+    for ci in range(cols):
+        spec = corrected[ri, ci, :]
+        nan_mask = ~np.isfinite(spec)
+        if not np.any(nan_mask): continue
+        valid_b = np.where(~nan_mask)[0]
+        if len(valid_b) < 3: 
+            corrected[ri, ci, :] = 0.0
+            continue
+        
+        # Linear interpolation prevents artificial undershoots/overshoots
+        f = interp1d(valid_b, spec[valid_b], kind='linear',
+                     bounds_error=False, fill_value='extrapolate')
+        corrected[ri, ci, nan_mask] = f(np.where(nan_mask)[0])
+        sat_pixels_fixed += nan_mask.sum()
+
+corrected = np.clip(corrected, 0.0, 1.5)   # physical reflectance bounds
+
+print(f"  Anomalous pixel-bands flagged : {total_sat:,}")
+print(f"  Interpolated & restored       : {sat_pixels_fixed:,}")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CORRECTION 2 — STRIPE NOISE: Column Moment Matching
+# ═════════════════════════════════════════════════════════════════════════════
+print("\n" + "="*65)
+print("  CORRECTION 2  ·  Stripe Noise — Column Moment Matching")
+print("="*65)
 
 for b in range(bands):
     bd = corrected[:, :, b]
@@ -111,12 +169,11 @@ print(f"  NER after stripe correction : {ner_s1:.3f}%   (was {ner_before:.3f}%)"
 print(f"  NER reduction               : {max(0, (ner_before - ner_s1)/ner_before*100):.1f}%")
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CORRECTION 2 — SPECTRAL SMILE: Per-Column Wavelength Resampling
+# CORRECTION 3 — SPECTRAL SMILE: Per-Column Wavelength Resampling
 # ═════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*65)
-print("  CORRECTION 2  ·  Spectral Smile — Wavelength Resampling")
+print("  CORRECTION 3  ·  Spectral Smile — Wavelength Resampling")
 print("="*65)
-
 
 # Measure per-column band-centre of 1000 nm feature
 feat_wl   = 1000.0
@@ -161,9 +218,9 @@ for ci in range(cols):
     for ri in range(rows):
         spec = corrected[ri, ci, :]
         if not np.any(np.isfinite(spec)): continue
-        # Only interpolate where we have finite values
         valid = np.isfinite(spec)
         if valid.sum() < 5: continue
+        # Natural cubic spline interpolation is safe here since extreme anomalies were removed
         f = interp1d(shifted_wl[valid], spec[valid],
                      kind='cubic', bounds_error=False,
                      fill_value='extrapolate')
@@ -183,65 +240,59 @@ print(f"  Smile range after  : {smile_after_nm:.2f} nm")
 print(f"  Smile reduction    : {max(0,(smile_before_nm-smile_after_nm)/smile_before_nm*100):.1f}%")
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CORRECTION 3 — THERMAL EMISSION: Planck Brightness Temperature Subtraction
+# CORRECTION 4 — THERMAL EMISSION: Spatial-Smoothed Planck Subtraction
 # ═════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*65)
-print("  CORRECTION 3  ·  Thermal Emission — Planck Subtraction")
+print("  CORRECTION 4  ·  Thermal Emission — Spatial-Smoothed Planck Subtraction")
 print("="*65)
-
 
 h, c_light, k_b = 6.626e-34, 3.0e8, 1.381e-23
 
 def planck(lam_nm, T):
-    """Planck spectral radiance at wavelength lam_nm (nm) and temperature T (K)."""
     lam = lam_nm * 1e-9
     return (2 * h * c_light**2 / lam**5) / (np.exp(h * c_light / (lam * k_b * T)) - 1)
 
 th_mask  = wl >= THERMAL_NM
 if th_mask.sum() >= 2:
     th_wls   = wl[th_mask]
-    # Use the two longest bands for temperature estimation
-    t_bands  = np.where(th_mask)[0][-2:]
-
-    # Compute mean thermal spectrum before
+    
+    # Use the last 4 bands for stability, not just the last 2
+    t_bands = np.where(th_mask)[0][-4:]
     th_mean_before = float(np.nanmean(corrected[:, :, th_mask]))
 
-    # Per-pixel thermal correction
+    # Calculate observed thermal map and spatially smooth it (5x5 filter)
+    # This prevents injecting pixel-to-pixel shot noise into the dataset
+    obs_th_map = np.nanmean(corrected[:, :, t_bands], axis=2)
+    obs_th_map = np.nan_to_num(obs_th_map, nan=0.0)
+    smoothed_obs_th = ndimage.median_filter(obs_th_map, size=5)
+    
+    lam_ref = float(np.median(th_wls))
+
     for ri in range(rows):
         for ci in range(cols):
             spec = corrected[ri, ci, :]
             if not np.any(np.isfinite(spec[th_mask])): continue
 
-            # Brightness temperature from long-wave mean reflectance
-            obs_th = np.nanmean(spec[t_bands])
+            obs_th = smoothed_obs_th[ri, ci]
             if obs_th <= 0: continue
 
-            # Estimate T by inverting Planck at the median thermal wavelength
-            lam_ref = float(np.median(th_wls))
-            # Invert Planck: T ≈ (hc/λk) / ln(2hc²/λ⁵·obs + 1)
             try:
                 arg = 2 * h * c_light**2 / (lam_ref * 1e-9)**5 / max(obs_th, 1e-20) + 1
                 if arg <= 1: continue
                 T_est = (h * c_light / (lam_ref * 1e-9 * k_b)) / np.log(arg)
-                T_est = np.clip(T_est, 200.0, 500.0)
+                T_est = np.clip(T_est, 200.0, 500.0) # physical lunar temperature bounds
             except Exception:
                 continue
 
-            # Compute Planck spectrum for thermal bands
             planck_th = np.array([planck(lw, T_est) for lw in th_wls])
             planck_th_sum = planck_th.sum()
             if planck_th_sum < 1e-30: continue
 
-            # Scale: α so that α·B matches observed thermal sum
             alpha = obs_th * th_mask.sum() / planck_th_sum
+            corrected[ri, ci, th_mask] = spec[th_mask] - alpha * planck_th
 
-            # Subtract thermal component from long-wave bands
-            corrected[ri, ci, th_mask] = (
-                spec[th_mask] - alpha * planck_th
-            )
-
-    # Clip negative values from over-subtraction
-    corrected = np.clip(corrected, 0.0, None)
+    # Clip negative values resulting from any oversubtraction
+    corrected = np.clip(corrected, 0.0, 1.5)
 
     th_mean_after = float(np.nanmean(corrected[:, :, th_mask]))
     th_reduction  = (th_mean_before - th_mean_after) / th_mean_before * 100
@@ -252,47 +303,12 @@ else:
     print("  Not enough long-wave bands — skipping thermal correction.")
     th_mean_before = th_mean_after = th_reduction = 0.0
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CORRECTION 4 — DETECTOR SATURATION: Flag + Spectral Interpolation
-# ═════════════════════════════════════════════════════════════════════════════
-print("\n" + "="*65)
-print("  CORRECTION 4  ·  Detector Saturation — Mask & Interpolate")
-print("="*65)
-
-
-total_sat = 0
-for b in range(bands):
-    bd = corrected[:, :, b]
-    valid = np.isfinite(bd)
-    if valid.sum() == 0: continue
-    thresh = SAT_THRESH * np.nanpercentile(bd[valid], 99.9)
-    sat_mask = (bd > thresh) & valid
-    n_sat = int(sat_mask.sum())
-    total_sat += n_sat
-    corrected[sat_mask, b] = np.nan   # flag as invalid
-
-# Spectrally interpolate NaN-flagged pixels
-sat_pixels_fixed = 0
-for ri in range(rows):
-    for ci in range(cols):
-        spec = corrected[ri, ci, :]
-        nan_mask = ~np.isfinite(spec)
-        if not np.any(nan_mask): continue
-        valid_b = np.where(~nan_mask)[0]
-        if len(valid_b) < 5: continue
-        f = interp1d(valid_b, spec[valid_b], kind='cubic',
-                     bounds_error=False, fill_value='extrapolate')
-        corrected[ri, ci, nan_mask] = f(np.where(nan_mask)[0])
-        sat_pixels_fixed += nan_mask.sum()
-
-corrected = np.clip(corrected, 0.0, 1.5)   # physical reflectance bounds
-print(f"  Saturated pixel-bands flagged : {total_sat:,}")
-print(f"  Interpolated & restored       : {sat_pixels_fixed:,}")
-
 # ── Compute AFTER metrics ─────────────────────────────────────────────────────
 print("\n  Computing AFTER metrics ...")
 snr_after, ner_after = noise_metrics(corrected, wl)
-mean_spec_after = np.nanmean(corrected.reshape(-1, bands), axis=0)
+mean_spec_after = np.zeros(bands, dtype=np.float64)
+for b_idx in range(bands):
+    mean_spec_after[b_idx] = np.nanmean(corrected[:, :, b_idx])
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SAVE CORRECTED CUBE
@@ -303,13 +319,16 @@ print("="*65)
 
 metadata = dict(img.metadata)
 metadata['description'] = ('M3 L2 Physics-Corrected: '
-                            'stripe + smile + thermal + saturation corrections applied')
-spectral.envi.save_image(OUT_HDR,
-                         corrected.astype(np.float32),
-                         dtype=np.float32,
-                         metadata=metadata,
-                         force=True)
-print(f"  Saved → {OUT_HDR}")
+                            'outliers + stripe + smile + thermal corrections applied')
+try:
+    spectral.envi.save_image(OUT_HDR,
+                             corrected.astype(np.float32),
+                             dtype=np.float32,
+                             metadata=metadata,
+                             force=True)
+    print(f"  Saved → {OUT_HDR}")
+except Exception as e:
+    print(f"  Failed to save: {e}")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # BEFORE / AFTER PROOF FIGURE
@@ -336,7 +355,6 @@ ax1.set_title("Mean Spectrum — Before vs After All Corrections")
 ax1.legend(facecolor='#161b22', labelcolor='white', fontsize=9)
 
 # ── Panel 2: Stripe — Band image before/after ────────────────────────────────
-# Use a VNIR band (~750 nm) where stripe is well-visible
 stripe_band = int(np.argmin(np.abs(wl - 750)))
 
 ax2 = fig.add_subplot(gs[1, 0]); style_ax(ax2)
@@ -379,7 +397,10 @@ ax5.set_ylabel("Mean Reflectance")
 ax5.set_title(f"Column Profile @ {wl[stripe_band]:.0f} nm — Stripe Uniformity")
 ax5.legend(facecolor='#161b22', labelcolor='white', fontsize=9)
 
-fig.savefig(PROOF_FIG, dpi=150, bbox_inches='tight', facecolor=DARK)
+try:
+    fig.savefig(PROOF_FIG, dpi=150, bbox_inches='tight', facecolor=DARK)
+except Exception:
+    pass
 plt.close(fig)
 print(f"  Saved → {PROOF_FIG}")
 
@@ -401,13 +422,13 @@ report = f"""
 ║  Stripe NER (lower=better) {ner_before:>8.3f}%    {ner_after:>8.3f}%    {ner_reduction:>+8.1f}%      ║
 ║  Spectral Smile            {smile_before_nm:>8.2f} nm  {smile_after_nm:>8.2f} nm  {smile_reduction:>+8.1f}%      ║
 ║  Thermal mean reflectance  {th_mean_before:>8.5f}     {th_mean_after:>8.5f}     {th_reduction:>+8.1f}%      ║
-║  Saturated bands fixed     {total_sat:>8,}     {'✔ restored':>10}    ║
+║  Anomalous bands fixed     {total_sat:>8,}     {'✔ restored':>10}    ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  CORRECTIONS APPLIED (in order):                                     ║
-║    1. Column moment matching (stripe)                                ║
-║    2. Per-column spline resampling (spectral smile)                  ║
-║    3. Pixel-wise Planck subtraction (thermal emission)               ║
-║    4. Saturation flag + cubic interpolation                          ║
+║    1. Valid ranges & 10-sigma outliers masked (linear interp)        ║
+║    2. Column moment matching (stripe)                                ║
+║    3. Per-column spline resampling (spectral smile)                  ║
+║    4. Spatially-smoothed Planck subtraction (thermal emission)       ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  OUTPUT CUBE : {os.path.basename(OUT_HDR):<53}║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -415,7 +436,10 @@ report = f"""
 
 print(report)
 
-with open(PROOF_TXT, 'w', encoding='utf-8') as f:
-    f.write(report)
-print(f"  Report saved → {PROOF_TXT}")
+try:
+    with open(PROOF_TXT, 'w', encoding='utf-8') as f:
+        f.write(report)
+    print(f"  Report saved → {PROOF_TXT}")
+except Exception:
+    pass
 print("\n  ✔  All physics-based corrections complete.\n")

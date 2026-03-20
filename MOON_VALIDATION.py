@@ -24,12 +24,20 @@ from sklearn.decomposition import PCA
 
 warnings.filterwarnings('ignore')
 
+import sys
+
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
-RAW_HDR   = r"D:\Moon_Data\Scene_2\M3G20081201T064047_V01_RFL.HDR"
-FINAL_HDR = r"D:\Moon_Data\Scene_2\ML_Denoised\M3G20081201T064047_V01_RFL_FINAL.hdr"
-OUT_DIR   = r"D:\Moon_Data\Scene_2\Validation"
-OUT_TXT   = os.path.join(OUT_DIR, "scientific_validation_proof.txt")
-OUT_CSV   = os.path.join(OUT_DIR, "bandwise_metrics.csv")
+if len(sys.argv) > 1:
+    RAW_HDR = sys.argv[1]
+else:
+    RAW_HDR = r"D:\Moon_Data\Scene_2\M3G20081201T064047_V01_RFL.HDR"
+
+SCENE_DIR   = os.path.dirname(RAW_HDR)
+SCENE_BASE  = os.path.basename(RAW_HDR).replace('.HDR', '').replace('.hdr', '')
+FINAL_HDR   = os.path.join(SCENE_DIR, "ML_Denoised", f"{SCENE_BASE}_FINAL.hdr")
+OUT_DIR     = os.path.join(SCENE_DIR, "Validation")
+OUT_TXT     = os.path.join(OUT_DIR, "scientific_validation_proof.txt")
+OUT_CSV     = os.path.join(OUT_DIR, "bandwise_metrics.csv")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -90,7 +98,10 @@ def compute_metrics(cube, wl):
     # If noise is high, variance is scattered across many components.
     # If noise is low and signal is true mineralogy, >99% variance is in first 3 PCs.
     flat = cube.reshape(-1, bands)
-    valid_mask = np.all(np.isfinite(flat), axis=1)
+    valid_mask = np.ones((rows, cols), dtype=bool)
+    for b_idx in range(bands):
+        valid_mask &= np.isfinite(cube[:, :, b_idx])
+    valid_mask = valid_mask.flatten()
     if valid_mask.sum() > 1000:
         flat_valid = flat[valid_mask]
         pca = PCA(n_components=10)

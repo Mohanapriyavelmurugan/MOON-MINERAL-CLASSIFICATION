@@ -13,9 +13,15 @@ from scipy import ndimage, stats
 
 warnings.filterwarnings('ignore')
 
+import sys, os
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
-HDR_PATH    = r"D:\Moon_Data\Scene_2\M3G20081201T064047_V01_RFL.HDR"
-REPORT_PATH = r"D:\Moon_Data\Scene_2\Noise_Characterisation\noise_report.txt"
+if len(sys.argv) > 1:
+    HDR_PATH = sys.argv[1]
+else:
+    HDR_PATH = r"D:\Moon_Data\Scene_2\M3G20081201T064047_V01_RFL.HDR"
+
+SCENE_DIR   = os.path.dirname(HDR_PATH)
+REPORT_PATH = os.path.join(SCENE_DIR, "Noise_Characterisation", "noise_report.txt")
 THERMAL_NM  = 2500   # thermal emission onset wavelength (nm)
 SPIKE_THR   = 3.5    # MAD Z-score threshold for spike detection
 # ──────────────────────────────────────────────────────────────────────────────
@@ -135,7 +141,9 @@ results["3. Spectral Spikes (Impulse)"] = (
 th_mask   = wavelengths >= THERMAL_NM
 vnir_mask = (wavelengths >= 500) & (wavelengths <= 1200)
 
-mean_spec = np.nanmean(cube.reshape(-1, bands), axis=0)
+mean_spec = np.zeros(bands, dtype=np.float32)
+for b_idx in range(bands):
+    mean_spec[b_idx] = np.nanmean(cube[:, :, b_idx])
 
 if th_mask.sum() >= 2 and vnir_mask.sum() >= 3:
     vnir_mean  = np.nanmean(mean_spec[vnir_mask])
