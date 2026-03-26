@@ -65,8 +65,12 @@ print("  STEP 0  ·  Loading M3 L2 Cube")
 print("="*65)
 
 img  = spectral.open_image(HDR_PATH)
-cube = np.array(img.load(), dtype=np.float64)
-rows, cols, bands = cube.shape
+in_cube = img.open_memmap(interleave='bip', writable=False)
+rows, cols, bands = in_cube.shape
+
+cube = np.empty((rows, cols, bands), dtype=np.float32)
+for b in range(bands):
+    cube[:, :, b] = np.array(in_cube[:, :, b], dtype=np.float32)
 
 wl_raw = img.metadata.get('wavelength', [])
 wl = np.array([float(w) for w in wl_raw])
@@ -117,21 +121,27 @@ for b in range(bands):
 
 # Spectrally interpolate NaN-flagged pixels (Using LINEAR to avoid cubic ringing)
 sat_pixels_fixed = 0
-for ri in range(rows):
-    for ci in range(cols):
-        spec = corrected[ri, ci, :]
-        nan_mask = ~np.isfinite(spec)
-        if not np.any(nan_mask): continue
-        valid_b = np.where(~nan_mask)[0]
-        if len(valid_b) < 3: 
-            corrected[ri, ci, :] = 0.0
-            continue
-        
-        # Linear interpolation prevents artificial undershoots/overshoots
-        f = interp1d(valid_b, spec[valid_b], kind='linear',
-                     bounds_error=False, fill_value='extrapolate')
-        corrected[ri, ci, nan_mask] = f(np.where(nan_mask)[0])
-        sat_pixels_fixed += nan_mask.sum()
+flat_corrected = corrected.reshape(-1, bands)
+
+# Only iterate over pixels that genuinely contain NaNs
+has_nan = np.isnan(flat_corrected).any(axis=1)
+nan_indices = np.where(has_nan)[0]
+
+for idx in nan_indices:
+    spec = flat_corrected[idx]
+    nan_mask = ~np.isfinite(spec)
+    valid_b = np.where(~nan_mask)[0]
+    if len(valid_b) < 3: 
+        flat_corrected[idx, :] = 0.0
+        continue
+    
+    # Linear interpolation prevents artificial undershoots/overshoots
+    f = interp1d(valid_b, spec[valid_b], kind='linear',
+                 bounds_error=False, fill_value='extrapolate')
+    flat_corrected[idx, nan_mask] = f(np.where(nan_mask)[0])
+    sat_pixels_fixed += nan_mask.sum()
+
+corrected = flat_corrected.reshape(rows, cols, bands)
 
 corrected = np.clip(corrected, 0.0, 1.5)   # physical reflectance bounds
 
@@ -215,8 +225,23 @@ for ci in range(cols):
     shift_nm = smooth_shift[ci] * bw
     if abs(shift_nm) < 0.01: continue           # negligible shift
     shifted_wl = wl + shift_nm                  # column's actual wavelength grid
-    for ri in range(rows):
-        spec = corrected[ri, ci, :]
+    
+    col_data = corrected[:, ci, :]
+    
+    # Vectorize: Find completely finite rows to interpolate instantly in a single batch
+    valid_mask_2d = np.isfinite(col_data)
+    valid_rows = np.where(valid_mask_2d.all(axis=1))[0]
+    
+    if len(valid_rows) > 0:
+        f = interp1d(shifted_wl, col_data[valid_rows], axis=-1,
+                     kind='cubic', bounds_error=False,
+                     fill_value='extrapolate')
+        corrected[valid_rows, ci, :] = f(wl)
+
+    # Process any remaining rows with isolated missing data via the robust fallback loop
+    invalid_rows = np.where(~valid_mask_2d.all(axis=1))[0]
+    for ri in invalid_rows:
+        spec = col_data[ri]
         if not np.any(np.isfinite(spec)): continue
         valid = np.isfinite(spec)
         if valid.sum() < 5: continue
@@ -268,28 +293,51 @@ if th_mask.sum() >= 2:
     
     lam_ref = float(np.median(th_wls))
 
-    for ri in range(rows):
-        for ci in range(cols):
-            spec = corrected[ri, ci, :]
-            if not np.any(np.isfinite(spec[th_mask])): continue
-
-            obs_th = smoothed_obs_th[ri, ci]
-            if obs_th <= 0: continue
-
-            try:
-                arg = 2 * h * c_light**2 / (lam_ref * 1e-9)**5 / max(obs_th, 1e-20) + 1
-                if arg <= 1: continue
-                T_est = (h * c_light / (lam_ref * 1e-9 * k_b)) / np.log(arg)
-                T_est = np.clip(T_est, 200.0, 500.0) # physical lunar temperature bounds
-            except Exception:
-                continue
-
-            planck_th = np.array([planck(lw, T_est) for lw in th_wls])
-            planck_th_sum = planck_th.sum()
-            if planck_th_sum < 1e-30: continue
-
-            alpha = obs_th * th_mask.sum() / planck_th_sum
-            corrected[ri, ci, th_mask] = spec[th_mask] - alpha * planck_th
+    # Vectorized Planck Temperature Estimation & Subtraction
+    valid_th_mask = (smoothed_obs_th > 0)
+    T_est_map = np.zeros((rows, cols), dtype=np.float64)
+    
+    term1 = 2 * h * c_light**2 / (lam_ref * 1e-9)**5
+    arg_map = np.zeros((rows, cols), dtype=np.float64)
+    arg_map[valid_th_mask] = term1 / np.maximum(smoothed_obs_th[valid_th_mask], 1e-20) + 1
+    
+    valid_arg_mask = valid_th_mask & (arg_map > 1.0)
+    term2 = h * c_light / (lam_ref * 1e-9 * k_b)
+    T_est_map[valid_arg_mask] = term2 / np.log(arg_map[valid_arg_mask])
+    T_est_map = np.clip(T_est_map, 200.0, 500.0)
+    
+    # Calculate Planck curves for all valid pixels
+    valid_idx = np.where(valid_arg_mask)
+    if len(valid_idx[0]) > 0:
+        T_valid = T_est_map[valid_idx].reshape(-1, 1) # Shape: (K, 1)
+        lam_2d = (th_wls * 1e-9).reshape(1, -1)       # Shape: (1, B)
+        
+        planck_valid = (2 * h * c_light**2 / lam_2d**5) / (np.exp(h * c_light / (lam_2d * k_b * T_valid)) - 1)
+        planck_sum_valid = planck_valid.sum(axis=1, keepdims=True) # Shape: (K, 1)
+        
+        mask_planck = (planck_sum_valid.flatten() >= 1e-30)
+        
+        if np.any(mask_planck):
+            obs_th_valid = smoothed_obs_th[valid_idx].reshape(-1, 1)
+            alpha_valid = obs_th_valid * th_mask.sum() / planck_sum_valid
+            
+            # Extract only pixels that passed all checks
+            final_valid_rows = valid_idx[0][mask_planck]
+            final_valid_cols = valid_idx[1][mask_planck]
+            
+            # Extract target spectra (K_final, B)
+            spec_th_valid = corrected[final_valid_rows, final_valid_cols][:, th_mask]
+            
+            alpha_final = alpha_valid[mask_planck]
+            planck_final = planck_valid[mask_planck]
+            
+            # Subtract
+            corrected_th = spec_th_valid - (alpha_final * planck_final)
+            
+            # Reassign back to the cube efficiently
+            b_indices = np.where(th_mask)[0]
+            for b_idx_local, b_real in enumerate(b_indices):
+                corrected[final_valid_rows, final_valid_cols, b_real] = corrected_th[:, b_idx_local]
 
     # Clip negative values resulting from any oversubtraction
     corrected = np.clip(corrected, 0.0, 1.5)

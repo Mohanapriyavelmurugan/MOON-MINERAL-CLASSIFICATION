@@ -80,8 +80,12 @@ def measure_noise(cube):
     step = max(1, rows // 50)
     total_px = 0; spike_px = 0
     for ri in range(0, rows, step):
+        # Load the whole row at once to avoid slow I/O if memory-mapped
+        row_data = np.array(cube[ri, :, :], dtype=np.float32)
+        row_data[row_data < -990] = np.nan
+        
         for ci in range(0, cols, 4):
-            spec = cube[ri, ci, :]
+            spec = row_data[ci, :]
             if not np.any(np.isfinite(spec)): continue
             total_px += 1
             
@@ -138,9 +142,8 @@ if not os.path.exists(HDR_PATH):
     raise FileNotFoundError(f"Input cube not found: {HDR_PATH}\nRun Physics Corrections first.")
 
 img = spectral.open_image(HDR_PATH)
-in_cube = np.array(img.load(), dtype=np.float32)
+in_cube = img.open_memmap(interleave='bip', writable=False)
 rows, cols, bands = in_cube.shape
-in_cube[in_cube < -990] = np.nan
 print(f"  Shape: {rows} × {cols} × {bands}")
 print(f"  Using device: {DEVICE}")
 
@@ -153,7 +156,14 @@ print(f"  Stripe NER : {ner_0:.3f}%   (Threshold: {THR_NER}%)")
 print(f"  Spike Pct  : {spike_0:.2f}%    (Threshold: {THR_SPIKE}%)")
 print(f"  Gauss SNR  : {snr_0:.1f}      (Threshold: {THR_SNR})")
 
-cube = in_cube.copy()
+# Create a RAM-backed copy (or process chunked if memory gets tight, but PyTorch requires tensors in memory)
+# We allocate exactly one copy of the working cube in RAM to prevent swapping.
+# Replace fill values ONLY here.
+cube = np.empty((rows, cols, bands), dtype=np.float32)
+for b in range(bands):
+    bd = np.array(in_cube[:, :, b], dtype=np.float32)
+    bd[bd < -990] = np.nan
+    cube[:, :, b] = bd
 
 # ── 3. CNN DESTRIPER ──────────────────────────────────────────────────────────
 if ner_0 > THR_NER:
@@ -190,19 +200,22 @@ if spike_0 > THR_SPIKE:
     t0 = time.time()
     spikes_fixed = 0
     for ri in range(rows):
-        for ci in range(cols):
-            spec = cube[ri, ci, :]
-            if not np.any(np.isfinite(spec)): continue
-            # FIXED: Tighter median filter, and checking absolute difference
-            med = ndimage.median_filter(spec, size=3)
-            diff = np.abs(spec - med)
-            mad = np.nanmedian(diff) + 0.005 # Noise floor
-            z = 0.6745 * diff / mad
-            # Only fix if it's statistically significant AND physically significant (>0.05 absolute diff)
-            spike_mask = (z > 3.5) & (diff > 0.05)
-            if spike_mask.sum() > 0:
-                cube[ri, ci, spike_mask] = med[spike_mask]
-                spikes_fixed += spike_mask.sum()
+        # We process row by row to vectorize and speed up execution
+        row_data = cube[ri, :, :]
+        # Vectorized 1D median filter across spectral axis
+        med_row = ndimage.median_filter(row_data, size=(1, 3))
+        diff_row = np.abs(row_data - med_row)
+        
+        mad_row = np.nanmedian(diff_row, axis=1, keepdims=True) + 0.005
+        z_row = 0.6745 * diff_row / mad_row
+        
+        spike_mask_row = (z_row > 3.5) & (diff_row > 0.05) & np.isfinite(row_data)
+        n_spikes = spike_mask_row.sum()
+        if n_spikes > 0:
+            row_data[spike_mask_row] = med_row[spike_mask_row]
+            cube[ri, :, :] = row_data
+            spikes_fixed += n_spikes
+            
     print(f"  Spikes detected and fixed: {spikes_fixed:,}")
     print(f"  MAD Filter completed in {time.time()-t0:.1f}s")
 else:
@@ -301,7 +314,9 @@ except:
 mean_spec_in = np.zeros(bands, dtype=np.float32)
 mean_spec_out = np.zeros(bands, dtype=np.float32)
 for b_idx in range(bands):
-    mean_spec_in[b_idx] = np.nanmean(in_cube[:, :, b_idx])
+    bd_in = np.array(in_cube[:, :, b_idx], dtype=np.float32)
+    bd_in[bd_in < -990] = np.nan
+    mean_spec_in[b_idx] = np.nanmean(bd_in)
     mean_spec_out[b_idx] = np.nanmean(cube[:, :, b_idx])
 
 fig, axes = plt.subplots(1, 2, figsize=(16, 6), facecolor='#0d1117')

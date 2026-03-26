@@ -46,7 +46,8 @@ SCRIPTS = [
     ("1. Noise Characterisation", "MOON_NOISE_CHARACTERISATION.py"),
     ("2. Physics-Based Corrections", "MOON_PHYSICS_CORRECTIONS.py"),
     ("3. ML Denoising (CNN + Autoencoder)", "MOON_ML_DENOISING.py"),
-    ("4. Scientific Validation", "MOON_VALIDATION.py")
+    ("4. Scientific Validation", "MOON_VALIDATION.py"),
+    ("5. Structure-Aware Contrastive Classification", "MOON_MINERAL_CLASSIFICATION.py")
 ]
 
 banner("STARTING END-TO-END M3 PIPELINE")
@@ -75,8 +76,9 @@ for stage_name, script_name in SCRIPTS:
         cwd=WORKSPACE
     )
     
-    for line in process.stdout:
-        print(line, end="")
+    if process.stdout:
+        for line in process.stdout:
+            print(line, end="")
         
     process.wait()
     

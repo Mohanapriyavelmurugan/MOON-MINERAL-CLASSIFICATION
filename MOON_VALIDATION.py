@@ -42,13 +42,13 @@ OUT_CSV     = os.path.join(OUT_DIR, "bandwise_metrics.csv")
 os.makedirs(OUT_DIR, exist_ok=True)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_cube(path):
+def load_cube_memmap(path):
     img = spectral.open_image(path)
-    cube = np.array(img.load(), dtype=np.float32)
-    cube[cube < -990] = np.nan
+    # Open as memory-map to prevent crushing system RAM
+    cube_mm = img.open_memmap(interleave='bip', writable=False)
     wl = np.array([float(w) for w in img.metadata.get('wavelength', [])])
     if wl.max() < 10: wl *= 1000.0
-    return cube, wl
+    return cube_mm, wl
 
 def compute_metrics(cube, wl):
     """Computes rigorous statistical noise metrics on a given cube."""
@@ -59,7 +59,8 @@ def compute_metrics(cube, wl):
     
     # 1 & 2. SNR and NER per band
     for b in range(bands):
-        bd = cube[:, :, b]
+        bd = np.array(cube[:, :, b], dtype=np.float32)
+        bd[bd < -990] = np.nan
         valid = np.isfinite(bd)
         if valid.sum() < 50: 
             snr[b] = np.nan; ner[b] = np.nan
@@ -81,7 +82,8 @@ def compute_metrics(cube, wl):
     total_px = 0; spike_px = 0
     for ri in range(0, rows, step):
         for ci in range(0, cols, 4):
-            spec = cube[ri, ci, :]
+            spec = np.array(cube[ri, ci, :], dtype=np.float32)
+            spec[spec < -990] = np.nan
             if not np.any(np.isfinite(spec)): continue
             total_px += 1
             med = np.nanmedian(spec)
@@ -92,20 +94,35 @@ def compute_metrics(cube, wl):
 
     # 4. Thermal Residual Margin (mean reflectance > 2500 nm)
     th_mask = wl > 2500
-    th_mean = float(np.nanmean(cube[:, :, th_mask])) if th_mask.sum() > 0 else 0.0
+    th_sum, th_count = 0.0, 0
+    if th_mask.sum() > 0:
+        for b_idx in np.where(th_mask)[0]:
+            bd = np.array(cube[:, :, b_idx], dtype=np.float32)
+            bd[bd < -990] = np.nan
+            valid = np.isfinite(bd)
+            th_sum += np.nansum(bd[valid])
+            th_count += valid.sum()
+    th_mean = float(th_sum / th_count) if th_count > 0 else 0.0
 
     # 5. PCA Information Concentration
     # If noise is high, variance is scattered across many components.
     # If noise is low and signal is true mineralogy, >99% variance is in first 3 PCs.
-    flat = cube.reshape(-1, bands)
-    valid_mask = np.ones((rows, cols), dtype=bool)
-    for b_idx in range(bands):
-        valid_mask &= np.isfinite(cube[:, :, b_idx])
-    valid_mask = valid_mask.flatten()
-    if valid_mask.sum() > 1000:
-        flat_valid = flat[valid_mask]
+    
+    # Stratified Sampling for PCA to avoid colossal RAM blowups:
+    # We sample 20,000 valid pixels across the scene rather than flattening millions.
+    sample_flat = []
+    sample_step = max(1, rows // 200)
+    for ri in range(0, rows, sample_step):
+        for ci in range(0, cols, 4):
+            sp = np.array(cube[ri, ci, :], dtype=np.float32)
+            sp[sp < -990] = np.nan
+            if np.all(np.isfinite(sp)):
+                sample_flat.append(sp)
+    
+    sample_flat = np.array(sample_flat)
+    if len(sample_flat) > 1000:
         pca = PCA(n_components=10)
-        pca.fit(flat_valid)
+        pca.fit(sample_flat)
         var_pc3 = float(np.sum(pca.explained_variance_ratio_[:3]) * 100)
     else:
         var_pc3 = np.nan
@@ -122,10 +139,10 @@ def compute_metrics(cube, wl):
 
 # ── EXECUTION ─────────────────────────────────────────────────────────────────
 print("\nLoading RAW cube ...")
-raw_cube, wl = load_cube(RAW_HDR)
+raw_cube, wl = load_cube_memmap(RAW_HDR)
 
 print("Loading FINAL DENOISED cube ...")
-fin_cube, _ = load_cube(FINAL_HDR)
+fin_cube, _ = load_cube_memmap(FINAL_HDR)
 
 print("\nComputing statistical metrics for RAW ... (this takes a moment)")
 m_raw = compute_metrics(raw_cube, wl)

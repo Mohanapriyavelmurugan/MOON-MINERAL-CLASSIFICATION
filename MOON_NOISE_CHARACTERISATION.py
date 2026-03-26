@@ -40,17 +40,14 @@ def bar(level):
 # ── LOAD DATA ─────────────────────────────────────────────────────────────────
 print("\nLoading M3 L2 cube ...")
 img  = spectral.open_image(HDR_PATH)
-cube = np.array(img.load(), dtype=np.float32)
-rows, cols, bands = cube.shape
+cube_mm = img.open_memmap(interleave='bip', writable=False)
+rows, cols, bands = cube_mm.shape
 
 # Wavelengths
 wl_raw = img.metadata.get('wavelength', [])
 wavelengths = np.array([float(w) for w in wl_raw])
 if wavelengths.max() < 10:
     wavelengths *= 1000.0       # µm → nm
-
-# Replace fill values
-cube[cube < -990] = np.nan
 
 print(f"  Shape      : {rows} × {cols} × {bands}")
 print(f"  Wavelengths: {wavelengths.min():.0f} – {wavelengths.max():.0f} nm\n")
@@ -62,7 +59,8 @@ results = {}   # noise_name -> (metric_value, level, description)
 # ══════════════════════════════════════════════════════════════════════════════
 snr_list = []
 for b in range(bands):
-    bd = cube[:, :, b]
+    bd = np.array(cube_mm[:, :, b], dtype=np.float32)
+    bd[bd < -990] = np.nan
     valid = np.isfinite(bd)
     if valid.sum() < 50:
         continue
@@ -89,7 +87,8 @@ results["1. Gaussian / Shot Noise"] = (
 # ══════════════════════════════════════════════════════════════════════════════
 ner_list = []
 for b in range(bands):
-    bd = cube[:, :, b]
+    bd = np.array(cube_mm[:, :, b], dtype=np.float32)
+    bd[bd < -990] = np.nan
     valid = np.isfinite(bd)
     if valid.sum() < 50:
         continue
@@ -115,7 +114,8 @@ spike_px  = 0
 
 for ri in range(0, rows, step):
     for ci in range(0, cols, 4):      # sample every 4th column
-        spec = cube[ri, ci, :].astype(np.float64)
+        spec = np.array(cube_mm[ri, ci, :], dtype=np.float64)
+        spec[spec < -990] = np.nan
         if not np.any(np.isfinite(spec)):
             continue
         total_px += 1
@@ -143,7 +143,9 @@ vnir_mask = (wavelengths >= 500) & (wavelengths <= 1200)
 
 mean_spec = np.zeros(bands, dtype=np.float32)
 for b_idx in range(bands):
-    mean_spec[b_idx] = np.nanmean(cube[:, :, b_idx])
+    bd = np.array(cube_mm[:, :, b_idx], dtype=np.float32)
+    bd[bd < -990] = np.nan
+    mean_spec[b_idx] = np.nanmean(bd)
 
 if th_mask.sum() >= 2 and vnir_mask.sum() >= 3:
     vnir_mean  = np.nanmean(mean_spec[vnir_mask])
@@ -171,10 +173,12 @@ bw        = float(np.nanmean(np.diff(wavelengths)))
 
 col_centres = []
 for ci in range(cols):
-    spec_col = np.nanmean(cube[:, ci, b_lo:b_hi], axis=0)
-    if not np.any(np.isfinite(spec_col)):
+    spec_col = np.array(cube_mm[:, ci, b_lo:b_hi], dtype=np.float32)
+    spec_col[spec_col < -990] = np.nan
+    spec_col_mean = np.nanmean(spec_col, axis=0)
+    if not np.any(np.isfinite(spec_col_mean)):
         continue
-    deriv = np.gradient(spec_col)
+    deriv = np.gradient(spec_col_mean)
     zcs   = np.where(np.diff(np.sign(deriv)) > 0)[0]
     if len(zcs) > 0:
         col_centres.append(zcs[0])
@@ -195,7 +199,8 @@ results["5. Spectral Smile"] = (
 # ══════════════════════════════════════════════════════════════════════════════
 max_sat_frac = 0.0
 for b in range(bands):
-    bd    = cube[:, :, b]
+    bd = np.array(cube_mm[:, :, b], dtype=np.float32)
+    bd[bd < -990] = np.nan
     valid = np.isfinite(bd)
     if valid.sum() == 0:
         continue
